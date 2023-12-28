@@ -1,0 +1,141 @@
+-- Extract and preprocess raw event data
+WITH raw_table AS (
+  SELECT 
+    TIMESTAMP_ADD(TIMESTAMP_MICROS(event_timestamp), INTERVAL 8 HOUR) AS event_time, 
+    user_id,
+    event_date
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE 
+    event_name = 'view_item' AND user_id IS NOT NULL
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  ORDER BY event_time ASC
+)
+
+-- Calculate total time spent by each user
+,total_time AS (
+  SELECT user_id,
+    SUM(timespent) AS timespent
+  FROM (
+    SELECT user_id, TIMESTAMP_DIFF(MAX(event_time), MIN(event_time), SECOND) AS timespent
+    FROM (
+      SELECT *, COUNTIF(start) OVER(ORDER BY event_time) AS grp
+      FROM (
+        SELECT *, IFNULL(LAG(user_id) OVER(ORDER BY event_time), '') != user_id AS start
+        FROM raw_table
+      )
+    )
+    GROUP BY user_id, grp
+  )
+  GROUP BY user_id
+  ORDER BY timespent DESC
+)
+
+-- Count the number of views by each user
+,view_times AS (
+  SELECT user_id,
+    COUNT(event_timestamp) AS count_col
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE user_id IS NOT NULL AND event_name = 'view_item'
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  GROUP BY user_id
+  ORDER BY count_col DESC
+)
+
+-- Calculate average time spent and count of views for each user
+,avg_time AS (
+  SELECT total_time.user_id, timespent, count_col
+  FROM total_time
+  JOIN view_times
+  ON total_time.user_id = view_times.user_id
+)
+
+-- Count the number of views, additions to cart, wishlist additions, and purchases by each user
+,view_table AS (
+  SELECT user_id, COUNT(event_name) AS view
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE event_name = 'view_item' 
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND user_id IS NOT NULL
+  GROUP BY user_id
+)
+
+,add_table AS (
+  SELECT user_id, COUNT(event_name) AS add_to_cart
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE event_name = 'add_to_cart'
+    AND user_id IS NOT NULL
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  GROUP BY user_id
+)
+
+,wishlist_table AS (
+  SELECT user_id, COUNT(event_name) AS add_to_wishlist
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE event_name = 'add_to_wishlist'
+    AND user_id IS NOT NULL
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  GROUP BY user_id
+)
+
+,purchase_table AS (
+  SELECT DISTINCT user_id, 
+    COUNT(event_name) AS purchase
+  FROM `my-project-97960-1685345314533.analytics_324466912.events_*`
+  WHERE event_name = 'purchase'
+    AND user_id IS NOT NULL
+    AND PARSE_DATE('%Y%m%d', event_date) <= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  GROUP BY user_id
+)
+
+-- Create a final table with aggregated data
+,final_table AS (
+  SELECT view_table.user_id,
+    view_table.view,
+    add_table.add_to_cart,
+    wishlist_table.add_to_wishlist,
+    purchase_table.purchase
+  FROM view_table
+  FULL JOIN add_table ON view_table.user_id = add_table.user_id
+  FULL JOIN wishlist_table ON view_table.user_id = wishlist_table.user_id
+  FULL JOIN purchase_table ON view_table.user_id = purchase_table.user_id
+  WHERE view_table.user_id IS NOT NULL
+  ORDER BY purchase DESC
+)
+
+-- Process the final table for reporting
+,raw_table_2 AS (
+  SELECT user_id, view,
+    IFNULL(add_to_cart, 0) AS add_to_cart,
+    IFNULL(add_to_wishlist, 0) AS add_to_wishlist,
+    CASE WHEN purchase IS NULL THEN 0 ELSE 1 END AS purchase_or_not
+  FROM final_table
+)
+
+,user_table AS (
+  SELECT user_id, view, add_to_cart, add_to_wishlist, purchase_or_not
+  FROM raw_table_2
+)
+
+-- Create a list table with additional calculated columns
+,list_table AS (
+  SELECT user_table.user_id, view, add_to_cart, add_to_wishlist, purchase_or_not,
+    ROUND(AVG(timespent)/AVG(count_col),2) AS avg_time_col
+  FROM user_table
+  LEFT JOIN avg_time
+  ON user_table.user_id = avg_time.user_id
+  GROUP BY user_id, view, add_to_cart, add_to_wishlist, purchase_or_not, avg_time.timespent,avg_time.count_col
+)
+
+-- Calculate probability using logistic regression coefficients
+,cal_table AS (
+  SELECT user_id, view, add_to_cart, add_to_wishlist, avg_time_col, purchase_or_not,
+    POW(2.71828,(-2.6180+(0.0107*view)+(0.2552*add_to_cart)+(-0.1073*add_to_wishlist)+(0.0044*avg_time_col))) AS e,
+    1 + POW(2.71828,(-2.6180+(0.0107*view)+(0.2552*add_to_cart)+(-0.1073*add_to_wishlist)+(0.0044*avg_time_col))) AS e_1
+  FROM list_table
+)
+
+-- Select final columns for reporting
+SELECT user_id, view, add_to_cart, add_to_wishlist, avg_time_col, purchase_or_not,
+  ROUND(e/e_1,3) AS probability
+FROM cal_table
+ORDER BY probability DESC
